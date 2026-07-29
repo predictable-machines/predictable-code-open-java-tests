@@ -3,10 +3,10 @@
 > [!WARNING]
 > **Internal testing scaffolding. Not an example, not a demo, not documentation.**
 >
-> This repository is public for one reason only: some of the GitHub integrations
-> we are testing (code scanning alerts, checks, pull request annotations) do not
-> work on private repositories. It exists so we can exercise those integrations
-> against a throwaway project.
+> This repository is public so that the GitHub integrations we are testing (code
+> scanning alerts, checks, pull request annotations) are available on it. It
+> exists for no purpose beyond exercising those integrations against a throwaway
+> project.
 >
 > It is **not** meant to illustrate anything:
 >

@@ -299,10 +299,10 @@ jobs:
       # `category` keeps this upload distinct from any other tool's, since GitHub
       # replaces the previous upload within a category.
       #
-      # `continue-on-error` while the repository is still private: code scanning
-      # needs a public repository or GitHub Advanced Security, and a run whose
-      # real subject is the source build should not fail on that. Drop it once
-      # the repository is public.
+      # `continue-on-error`: a failed publish should not fail a run whose real
+      # subject is the build and the sync. The consequence is that the run still
+      # reports green when this step fails, so if alerts stop appearing, this
+      # step is the first place to look.
       - name: Upload findings to code scanning
         if: ${{ !cancelled() }}
         continue-on-error: true
