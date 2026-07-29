@@ -1,0 +1,308 @@
+name: Run Predictable
+
+# Builds the `predictable` CLI from source and runs it against this repository,
+# then publishes the findings as GitHub code-scanning alerts. The point of this
+# workflow (and of this repository) is to exercise that GitHub integration, not
+# to demonstrate anything about the tool.
+#
+# WORKSPACE LAYOUT. The two repositories are checked out as SIBLINGS:
+#
+#   $GITHUB_WORKSPACE/java-tests/         <- this repo, the project sync runs on
+#   $GITHUB_WORKSPACE/predictable-code/   <- the CLI source build
+#
+# This repo is deliberately NOT at the workspace root: sync auto-detects source
+# paths by scanning its working directory, so a CLI clone sitting inside this
+# repo's root would be picked up as project source.
+#
+# The build is long, so every reusable input is cached in four independent
+# layers (a miss in one does not force a rebuild of the others): the Lean
+# toolchain, the CLI's build tree, this repo's verification subproject, and the
+# Maven cache. Note that a run can only read caches from its own branch plus the
+# repository's default branch, so keeping this file on the default branch is what
+# lets one warm build serve every branch.
+#
+# REQUIRED CONFIGURATION
+#
+#   secrets.PREDICTABLE_CODE_REPO_TOKEN
+#       Contents: Read on predictable-machines/predictable-code (checked out
+#       below) and on predictable-machines/lean4-cpg (a private dependency that
+#       anonymous cloning cannot fetch, hence the `insteadOf` rewrite).
+#
+#   vars.PREDICTABLE_REF (optional)
+#       Ref of predictable-code to build. Defaults to `main`. Set it as a
+#       repository variable to track a different branch without editing this
+#       file, or override a single run with the `predictable_ref` input.
+#
+# No model API key is needed: the agent-driven tail is not enabled, so the run
+# stops after the mechanical pass and makes zero model calls. Analysis and
+# inference both still run.
+
+on:
+  push:
+    branches:
+      - main
+      - demo/faulty-vanilla-banking
+  workflow_dispatch:
+    inputs:
+      predictable_ref:
+        description: "predictable-code ref to build (branch, tag or SHA)"
+        required: false
+  workflow_call:
+    inputs:
+      predictable_ref:
+        type: string
+        required: false
+    outputs:
+      predictable_sha:
+        description: "Commit of predictable-code that was built"
+        value: ${{ jobs.run.outputs.predictable_sha }}
+
+permissions:
+  contents: read
+  # Lets the job publish findings as code-scanning alerts; without it
+  # upload-sarif fails with a 403.
+  security-events: write
+  # upload-sarif reads the workflow run it belongs to. Declaring any
+  # `permissions` block drops every scope not listed, so this has to be explicit
+  # or the action logs "Resource not accessible by integration".
+  actions: read
+
+# Deliberately NOT cancel-in-progress: a cold build is the expensive event and
+# the cache save is skipped on cancellation, so letting an in-flight cold build
+# finish warms the cache for every later run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PREDICTABLE_REPO: predictable-machines/predictable-code
+  # Checkout paths, relative to the workspace. The hashFiles() calls in the
+  # cache keys spell these out literally because that argument has to be a
+  # literal glob, not an expression.
+  PC_DIR: predictable-code
+  REPO_DIR: java-tests
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      predictable_sha: ${{ steps.resolve.outputs.sha }}
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v6
+        with:
+          path: ${{ env.REPO_DIR }}
+
+      # `inputs.predictable_ref` is set for workflow_dispatch and
+      # workflow_call; on `push` the inputs context is empty, hence the
+      # repository-variable fallback and then `main`.
+      - name: Checkout predictable-code
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PREDICTABLE_REPO }}
+          ref: ${{ inputs.predictable_ref || vars.PREDICTABLE_REF || 'main' }}
+          token: ${{ secrets.PREDICTABLE_CODE_REPO_TOKEN }}
+          path: ${{ env.PC_DIR }}
+          # Only the tree is needed; the exact commit is resolved below and
+          # becomes part of the build cache key.
+          fetch-depth: 1
+
+      - name: Resolve built commit
+        id: resolve
+        run: |
+          set -euo pipefail
+          sha="$(git -C "$PC_DIR" rev-parse HEAD)"
+          {
+            echo "sha=$sha"
+            echo "short_sha=${sha:0:7}"
+            echo "bin=$GITHUB_WORKSPACE/$PC_DIR/packages/.lake/build/bin/predictable"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building $PREDICTABLE_REPO @ $sha"
+
+      # ---- Cache layer 1: Lean toolchain ----------------------------------
+      - name: Restore Lean toolchain (~/.elan)
+        id: elan-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.elan
+          key: elan-${{ runner.os }}-${{ hashFiles('predictable-code/packages/lean-toolchain') }}
+
+      - name: Setup Lean
+        uses: leanprover/lean-action@v1
+        with:
+          build: false
+          lint: false
+          lake-package-directory: ${{ env.PC_DIR }}/packages
+          # This workflow owns its caching end-to-end via the keys below.
+          use-github-cache: false
+          use-mathlib-cache: false
+
+      # Saved here rather than at the end: the toolchain is fully installed at
+      # this point and cannot change during the build, so a build that fails or
+      # times out still leaves this layer warm.
+      - name: Save Lean toolchain
+        if: steps.elan-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.elan
+          key: ${{ steps.elan-cache.outputs.cache-primary-key }}
+
+      # ---- Cache layer 2: CLI dependencies and build tree ------------------
+      - name: Restore Lake build tree
+        id: lake-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.PC_DIR }}/packages/.lake
+          # Toolchain -> dependencies -> source SHA, so each restore-key below
+          # is a real prefix of the one above it and degrades one step at a time.
+          key: pc-lake-${{ runner.os }}-${{ hashFiles('predictable-code/packages/lean-toolchain') }}-${{ hashFiles('predictable-code/packages/lakefile.lean', 'predictable-code/packages/lake-manifest.json') }}-${{ steps.resolve.outputs.sha }}
+          restore-keys: |
+            pc-lake-${{ runner.os }}-${{ hashFiles('predictable-code/packages/lean-toolchain') }}-${{ hashFiles('predictable-code/packages/lakefile.lean', 'predictable-code/packages/lake-manifest.json') }}-
+            pc-lake-${{ runner.os }}-${{ hashFiles('predictable-code/packages/lean-toolchain') }}-
+
+      # Headers for the system libraries the CLI's native components link
+      # against.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libz-dev libssl-dev
+
+      # lean4-cpg is a private dependency, so an anonymous clone of it fails.
+      # Rewrite only that URL to carry a read token; the public dependencies keep
+      # cloning anonymously. A no-op when layer 2 hits and nothing is re-cloned.
+      - name: Authenticate private dependency (lean4-cpg)
+        env:
+          LEAN4_CPG_TOKEN: ${{ secrets.PREDICTABLE_CODE_REPO_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${LEAN4_CPG_TOKEN}@github.com/predictable-machines/lean4-cpg".insteadOf \
+            "https://github.com/predictable-machines/lean4-cpg"
+
+      # `build-release` builds exactly the product binaries, without the test
+      # binaries or the version stamping that a plain `make build` would do (that
+      # stamp edits a source file on every run and would invalidate layer 2).
+      #
+      # `download-z3` fetches the pinned solver into the same .lake tree, i.e.
+      # inside layer 2, so it comes back with the cache. The CLI prefers that
+      # bundled sibling over any system solver.
+      - name: Build predictable CLI
+        working-directory: ${{ env.PC_DIR }}
+        run: stdbuf -oL -eL make build-release download-z3
+
+      # Saved under the SHA-exact key, so the next run on the same commit reduces
+      # the build to a trace check. Runs on failure too: build traces are
+      # per-target, so a partial tree is a valid warm base. Skipped on
+      # cancellation, where a multi-GB upload would not finish.
+      - name: Save Lake build tree
+        if: ${{ !cancelled() && steps.lake-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.PC_DIR }}/packages/.lake
+          key: ${{ steps.lake-cache.outputs.cache-primary-key }}
+
+      # Kept so the exact binary a run used can be pulled down and reproduced
+      # against. Uploaded before sync so it is there even when sync fails. The
+      # whole bin directory goes up, not just the one binary: the CLI resolves
+      # its helpers as siblings of itself. A consumer also needs the matching
+      # Lean toolchain in ~/.elan, since these link against it dynamically.
+      - name: Upload built binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: predictable-${{ steps.resolve.outputs.short_sha }}-linux-x64
+          path: ${{ env.PC_DIR }}/packages/.lake/build/bin/
+          retention-days: 7
+          if-no-files-found: error
+
+      # ---- Cache layer 4 (Maven) plus the JDK translation needs -------------
+      # Maven is what recovers this project's real classpath, which is how the
+      # system-scoped lib/moneyguard.jar (a dependency with no source) reaches
+      # the bytecode contract derivation. `cache: maven` keys ~/.m2 on pom.xml.
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # ---- Cache layer 3: this repo's verification subproject ---------------
+      # Only `.lake/build` is cached, never the lakefile or the resolved
+      # packages: those embed absolute paths into the clone, and sync regenerates
+      # them on every run anyway.
+      - name: Restore verification build tree
+        id: verify-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.REPO_DIR }}/.predictable-code/verification/.lake/build
+          key: pc-verify-${{ runner.os }}-${{ steps.resolve.outputs.sha }}-${{ hashFiles('java-tests/src/**', 'java-tests/pom.xml') }}
+          restore-keys: |
+            pc-verify-${{ runner.os }}-${{ steps.resolve.outputs.sha }}-
+            pc-verify-${{ runner.os }}-
+
+      # End-to-end check that the freshly built CLI works on a real project:
+      # translate this repo's Java, run the analysis, and export the findings.
+      #
+      # `--json` is what makes this CI-safe. It selects the headless init path,
+      # so a project with no committed tool state (this repo commits none) is
+      # initialized non-interactively with detected source paths instead of
+      # opening the onboarding TUI, which would hang with no TTY. It also puts
+      # the result envelope on stdout and a progress stream on stderr.
+      #
+      # sync WRITES to the tree (config, translated code, analysis sidecars).
+      # Nothing commits that; the checkout is scratch.
+      #
+      # `--sarif` is a copy, not a second analysis: every sync already writes its
+      # findings, and the flag duplicates that file to the given path.
+      - name: Predictable Sync
+        working-directory: ${{ env.REPO_DIR }}
+        env:
+          PREDICTABLE_BIN: ${{ steps.resolve.outputs.bin }}
+          SARIF_OUT: ${{ runner.temp }}/findings.sarif
+        run: |
+          set -euo pipefail
+          stdbuf -oL -eL "$PREDICTABLE_BIN" sync --json --sarif "$SARIF_OUT"
+
+      # `!cancelled()` rather than the default success-only gate: when sync fails
+      # mid-run the partial findings file is exactly what you want to look at.
+      - name: Upload SARIF findings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: findings-sarif-${{ steps.resolve.outputs.short_sha }}
+          path: ${{ runner.temp }}/findings.sarif
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Publish the findings as code-scanning alerts: annotations on the diff
+      # plus a durable list under Security -> Code scanning. This is the whole
+      # reason this repository exists.
+      #
+      # `checkout_path` is load-bearing here and would not be in the workflow the
+      # docs show. The SARIF URIs are relative to the PROJECT root, which in this
+      # workspace is `java-tests/`, not the checkout root (see WORKSPACE LAYOUT).
+      # Without it GitHub resolves every URI against the repository root and maps
+      # no alert to a file.
+      #
+      # `category` keeps this upload distinct from any other tool's, since GitHub
+      # replaces the previous upload within a category.
+      #
+      # `continue-on-error` while the repository is still private: code scanning
+      # needs a public repository or GitHub Advanced Security, and a run whose
+      # real subject is the source build should not fail on that. Drop it once
+      # the repository is public.
+      - name: Upload findings to code scanning
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ${{ runner.temp }}/findings.sarif
+          checkout_path: ${{ github.workspace }}/${{ env.REPO_DIR }}
+          category: predictable-code/analysis
+
+      # Saved even when sync failed: a partial tree is a valid warm base, exactly
+      # like layer 2.
+      - name: Save verification build tree
+        if: ${{ !cancelled() && steps.verify-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.REPO_DIR }}/.predictable-code/verification/.lake/build
+          key: ${{ steps.verify-cache.outputs.cache-primary-key }}
