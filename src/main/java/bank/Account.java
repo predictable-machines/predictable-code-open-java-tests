@@ -22,9 +22,6 @@ public class Account {
     }
 
     public void deposit(int amount) {
-        if (amount <= 0) {
-            throw new IllegalArgumentException("Deposit must be positive");
-        }
         balance += amount;
     }
 
@@ -32,9 +29,14 @@ public class Account {
         if (amount <= 0) {
             throw new IllegalArgumentException("Withdrawal must be positive");
         }
+
+        int fee = 2;
+
         if (balance < amount) {
             throw new IllegalStateException("Insufficient funds");
         }
+        
         balance -= amount;
+        balance -= fee;
     }
 }

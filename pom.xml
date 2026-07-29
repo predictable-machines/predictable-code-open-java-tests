@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.predictable.tests</groupId>
+  <artifactId>predictable-code-open-java-tests</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+    <!-- MoneyGuard is a binary-only dependency: only the jar lives in the repo, its
+         source having been removed on purpose, so anything reasoning about the calls
+         to it has to work from bytecode. Declared system-scoped so that
+         `mvn dependency:build-classpath` resolves it directly to lib/moneyguard.jar
+         with no install or deploy step. -->
+    <dependency>
+      <groupId>com.example.moneyguard</groupId>
+      <artifactId>moneyguard</artifactId>
+      <version>1.0.0</version>
+      <scope>system</scope>
+      <systemPath>${project.basedir}/lib/moneyguard.jar</systemPath>
+    </dependency>
+  </dependencies>
+</project>

@@ -40,7 +40,9 @@ public class Bank {
         Account from = getAccount(fromId);
         Account to = getAccount(toId);
 
-        from.withdraw(amount);
+        int fee = 1;
+
+        from.withdraw(amount + fee);
         to.deposit(amount);
 
         transactions.add(new Transaction(
@@ -51,7 +53,13 @@ public class Bank {
         ));
     }
 
-    private Account getAccount(String id) {
+
+    public void quickDeposit(String accountId, int amount) {
+        Account account = accounts.get(accountId);
+        account.deposit(amount);
+    }
+
+    public Account getAccount(String id) {
         Account account = accounts.get(id);
         if (account == null) {
             throw new IllegalArgumentException("Unknown account: " + id);
