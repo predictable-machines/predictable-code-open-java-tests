@@ -185,9 +185,30 @@ jobs:
       # `download-z3` fetches the pinned solver into the same .lake tree, i.e.
       # inside layer 2, so it comes back with the cache. The CLI prefers that
       # bundled sibling over any system solver.
+      #
+      # THE BUILD OUTPUT IS DELIBERATELY NOT IN THIS LOG. This repository is
+      # public, which makes its run logs world-readable, and the build output
+      # names modules of a private codebase as it elaborates them. It is captured
+      # to a file that is never uploaded: an artifact would not help, since
+      # artifacts of a public repository are downloadable too. A build failure
+      # here is therefore diagnosed by reproducing it against predictable-code
+      # directly, not from this run.
       - name: Build predictable CLI
         working-directory: ${{ env.PC_DIR }}
-        run: stdbuf -oL -eL make build-release download-z3
+        env:
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          set -uo pipefail
+          echo "Building; output captured to a file that stays on the runner."
+          if make build-release download-z3 > "$BUILD_LOG" 2>&1; then
+            echo "Build OK ($(wc -l < "$BUILD_LOG") lines captured, not printed)."
+          else
+            status=$?
+            echo "::error::Build failed (exit $status). Output withheld: this is a"\
+                 "public log and the build names private modules. Reproduce against"\
+                 "predictable-code to see it."
+            exit "$status"
+          fi
 
       # Saved under the SHA-exact key, so the next run on the same commit reduces
       # the build to a trace check. Runs on failure too: build traces are
@@ -200,18 +221,11 @@ jobs:
           path: ${{ env.PC_DIR }}/packages/.lake
           key: ${{ steps.lake-cache.outputs.cache-primary-key }}
 
-      # Kept so the exact binary a run used can be pulled down and reproduced
-      # against. Uploaded before sync so it is there even when sync fails. The
-      # whole bin directory goes up, not just the one binary: the CLI resolves
-      # its helpers as siblings of itself. A consumer also needs the matching
-      # Lean toolchain in ~/.elan, since these link against it dynamically.
-      - name: Upload built binaries
-        uses: actions/upload-artifact@v7
-        with:
-          name: predictable-${{ steps.resolve.outputs.short_sha }}-linux-x64
-          path: ${{ env.PC_DIR }}/packages/.lake/build/bin/
-          retention-days: 7
-          if-no-files-found: error
+      # NO BINARY ARTIFACT. The private variant of this workflow uploads the built
+      # bin directory so a run's exact binary can be pulled down. That step is
+      # removed here on purpose: artifacts of a public repository are
+      # downloadable, so uploading them would publish compiled binaries of a
+      # private codebase. The build cache (layer 2) still keeps rebuilds cheap.
 
       # ---- Cache layer 4 (Maven) plus the JDK translation needs -------------
       # Maven is what recovers this project's real classpath, which is how the
