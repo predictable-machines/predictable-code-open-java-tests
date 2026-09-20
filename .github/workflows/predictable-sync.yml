@@ -1,0 +1,319 @@
+# Predictable Code — analysis in your own GitHub Actions.
+#
+# WHAT THIS RUNS AND WHERE. Everything happens on your runner, in your repository,
+# billed to your account. Predictable's hosted Control Center dispatches this workflow
+# and reads the results you commit; it never runs your code and never holds a copy of
+# it. That is the whole compute model, and this file is the visible, auditable,
+# revocable form of it — delete it and the hosted side can do nothing to this repo.
+#
+# WHAT IT NEEDS FROM US. Only a download. The CLI lives in a private repository, so the
+# job proves who it is with the OIDC token GitHub mints for it and receives a
+# short-lived, pre-signed URL in return. No secret is stored in this repository, none
+# is configured, and no credential of ours ever reaches this runner.
+#
+# WHAT IT WRITES. `.predictable-code/` — the specs, inferred requirements, analysis and
+# datasets — onto a branch, as a pull request. Never straight to your default branch.
+name: Predictable Code
+
+on:
+  workflow_dispatch:
+    inputs:
+      control_plane:
+        description: 'Control Center base URL'
+        required: true
+        type: string
+      release_tag:
+        description: "Release to run, or 'latest'"
+        required: false
+        default: latest
+        type: string
+      runner:
+        # A BIGGER MACHINE IS THE ONLY LEVER FOR A BIG REPOSITORY TODAY, so it is
+        # offered rather than hidden.
+        #
+        # Measured on a 1,213-file TypeScript repository on the standard runner
+        # (2 cores, 7 GB): the tsc front end exhausted its 3,374 MB V8 old-space budget
+        # and TypeScript was reported as not translated, which leaves the analysis with
+        # nothing to read. Raising the budget on THAT machine does not help — V8's RSS
+        # runs above its old-space cap, so a cap near the machine's size trades a clean
+        # heap error for the kernel killing the process, which is why
+        # `nodeFrontEndHeapMb` caps at half the measured headroom on purpose.
+        #
+        # Sharding would be the answer that scales, and it is NOT available: a split
+        # invocation emits 10 of 95 documents differently and resolves fewer call
+        # targets, which reads downstream as fewer obligations against identical code.
+        # `make check-il-identity` gates that work and is red by design until it lands.
+        description: 'Runner to analyse on. A large repository needs more memory than the standard runner has.'
+        required: false
+        default: ubuntu-24.04
+        type: string
+      heap_mb:
+        # Only useful together with a bigger runner, for the reason above. Empty means
+        # the product decides from the memory it can actually see, which is the right
+        # default and the one every measurement here supports.
+        description: 'Override the tsc front end V8 old-space budget, in MB. Leave empty to let the run size it from measured headroom.'
+        required: false
+        default: ''
+        type: string
+
+# Least privilege, and each one is load-bearing:
+#   contents     — check the code out, and push the results branch
+#   id-token     — mint the OIDC token that authenticates this job to the control plane
+#   pull-requests— open the PR carrying the results
+permissions:
+  contents: write
+  id-token: write
+  pull-requests: write
+
+# One analysis at a time per ref. Two concurrent syncs in one tree is a documented
+# hazard, not a race we are guessing at.
+concurrency:
+  group: predictable-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Full history: the analysis records which commit it describes, and a shallow
+          # clone makes that unanswerable.
+          fetch-depth: 0
+
+      - name: Fetch a short-lived download of the CLI
+        id: toolchain
+        env:
+          CONTROL_PLANE: ${{ inputs.control_plane }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          # The audience is the control plane itself. GitHub mints a token for whatever
+          # audience is asked for, so naming it here is what stops this token being
+          # replayable at any other service.
+          OIDC=$(curl -sSf \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${CONTROL_PLANE}" | jq -r '.value')
+
+          # ONE helper for all six assets. A signed URL is a credential for the life of
+          # its signature, so it must never reach the command line, a log, or a step
+          # output: `-K` makes curl read it from a file, keeping it out of `ps` and out
+          # of any shell trace, and the file is deleted the moment it is consumed.
+          #
+          # `--fail-with-body` so a refusal is readable — the control plane explains
+          # itself in JSON, and a bare `-f` would discard exactly that.
+          LAST_RESPONSE=""
+          fetch() { # fetch <query> <destination>
+            local q="$1" dest="$2"
+            LAST_RESPONSE=$(curl -sS --fail-with-body \
+              -H "Authorization: Bearer ${OIDC}" \
+              "${CONTROL_PLANE}/api/cloud/toolchain?${q}&tag=${RELEASE_TAG}")
+            printf 'url = "%s"\n' "$(echo "${LAST_RESPONSE}" | jq -r '.url')" > /tmp/pc-curlrc
+            curl -sSfL -o "${dest}" -K /tmp/pc-curlrc || {
+              echo "::error::the signed download for ${q} failed or expired"
+              rm -f /tmp/pc-curlrc
+              exit 1
+            }
+            rm -f /tmp/pc-curlrc
+          }
+
+          # THE SAME LAYOUT `install.sh` PRODUCES, and that is the whole requirement:
+          # the launcher resolves the binary as `$PREDICTABLE_HOME/bin/predictable`, so
+          # a flat root here is an install the launcher correctly refuses to run
+          # ("no binary at .../bin/predictable; this install is incomplete"). A second
+          # layout would also be a second thing to keep in step with the launcher.
+          # OUTSIDE THE CHECKOUT, and that is not tidiness. Placed inside it, the
+          # install root is part of the project as far as any scan is concerned:
+          # `predictable init --accept-config-suggestions` walked it and reported
+          # Lean's own sources, z3's bundled python and node's docs as this
+          # repository's code paths, turning a 400-file project into 20,775 files to
+          # translate. `$RUNNER_TEMP` is on the same filesystem and outside the tree.
+          UNPACK="${RUNNER_TEMP}/predictable-pkg"
+          mkdir -p "$UNPACK"
+
+          # THE RUNTIME PACKAGE, NOT A BARE BINARY.
+          #
+          # A bare `predictable` can analyse Java and nothing else: the TypeScript front
+          # end is a binary PLUS `typescript-tsc/dist/emit.js` and a
+          # `node_modules/typescript` tree, which is a directory and can never be an
+          # individual release asset. Measured on the first customer-shaped run — the
+          # job installed the binary, provisioned a toolchain successfully, and then
+          # died at `predictable_typescript_direct binary not found next to
+          # predictable` having translated nothing.
+          #
+          # The package also carries the Lean toolchain, the pinned z3 and node, and the
+          # compiled artefacts a generated verification project imports, so there is no
+          # separate provisioning step: `make test-bundle-install` proves exactly this
+          # shape — unpacked where it was not built, system PATH only, analysing a real
+          # project.
+          fetch "platform=linux-x64&kind=runtime" "${RUNNER_TEMP}/predictable-runtime.tar.gz"
+          # Read off the response we already have, rather than a second call that would
+          # mint a signed URL nobody downloads.
+          echo "tag=$(echo "${LAST_RESPONSE}" | jq -r '.tag')" >> "$GITHUB_OUTPUT"
+          echo "schema_hash=$(echo "${LAST_RESPONSE}" | jq -r '.schemaHash // ""')" >> "$GITHUB_OUTPUT"
+
+          tar -xzf "${RUNNER_TEMP}/predictable-runtime.tar.gz" -C "$UNPACK"
+          rm -f "${RUNNER_TEMP}/predictable-runtime.tar.gz"
+
+          # The archive holds ONE `predictable-runtime-*` directory, and that directory
+          # is the install root — the same layout `install.sh` produces, which is what
+          # `launcher.sh` inside it resolves against.
+          set -- "$UNPACK"/predictable-runtime-*/
+          PC_HOME="${1%/}"
+          [ -x "$PC_HOME/bin/predictable" ] || {
+            echo "::error::the runtime package holds no bin/predictable; this release cannot analyse"
+            exit 1
+          }
+
+          echo "predictable_home=$PC_HOME" >> "$GITHUB_OUTPUT"
+          echo "Installed the runtime package from ${RELEASE_TAG}"
+
+      - name: Clear state written by a different build
+        env:
+          EXPECTED: ${{ steps.toolchain.outputs.schema_hash }}
+        run: |
+          set -euo pipefail
+          STATE=.predictable-code
+          [ -d "$STATE" ] || { echo "No committed state; this is a first analysis."; exit 0; }
+
+          FOUND=""
+          [ -f "$STATE/schema-hash" ] && FOUND=$(tr -d '[:space:]' < "$STATE/schema-hash")
+
+          # Cleared rather than reconciled, and never silently: there is nobody to
+          # prompt in CI, so the desktop tool's drift dialogue has no analogue here. An
+          # UNKNOWN expected stamp also clears — discarding reuse costs time, and
+          # reporting an old build's dataset as current costs trust.
+          if [ -n "$EXPECTED" ] && [ "$FOUND" = "$EXPECTED" ]; then
+            echo "Committed state was written by this build ($FOUND); keeping it for reuse."
+          else
+            echo "::notice::Replacing committed state: found '${FOUND:-none}', expected '${EXPECTED:-unknown}'."
+            rm -rf "$STATE"
+          fi
+
+      - name: Analyse
+        id: analyse
+        env:
+          PC_HOME: ${{ steps.toolchain.outputs.predictable_home }}
+          # Empty is NOT the same as unset for this knob: the product reads the variable
+          # and an empty string is not a number, so it falls back to measured headroom —
+          # which is what an empty input should mean.
+          PREDICTABLE_TS_FRONTEND_HEAP_MB: ${{ inputs.heap_mb }}
+        run: |
+          set -euo pipefail
+          # THE LAUNCHER, never the binary directly. `launcher.sh` is what puts the
+          # provisioned toolchain on PATH — running the raw binary is how a `lake` or a
+          # `lean` spawn resolves to whatever the runner had, or to nothing.
+          predictable() { PREDICTABLE_HOME="$PC_HOME" "$PC_HOME/launcher.sh" "$@"; }
+          if [ ! -f .predictable-code/project.json ]; then
+            # Headless configuration: scans the tree and populates source paths and
+            # extensions itself, because there is no one here to answer prompts.
+            predictable init "${GITHUB_REPOSITORY##*/}" \
+              --path "$PWD/.predictable-code" --accept-config-suggestions
+          fi
+          predictable sync --path "$PWD/.predictable-code" --json > sync.json || true
+
+          # A SYNC REPORTS ITS VERDICT, NOT ITS EXIT CODE. `degraded` (only part of the
+          # project translated) and `mechanical` (stopped before proving) both exit 0,
+          # so reading the exit status alone reports a partial analysis as a clean one.
+          # THE VERDICT IS THE SINGLE KEY OF `result`, not `result` itself.
+          #
+          # `SyncResponse` is an inductive — `inSync`, `mechanical`, `degraded`,
+          # `verificationError` and the rest — so `.result` serialises as an OBJECT and
+          # `jq -r '.result'` prints the whole thing across many lines. A multi-line
+          # value written as `result=…` into `$GITHUB_OUTPUT` is malformed, so the
+          # propose step read it as EMPTY and titled the pull request
+          # "Predictable Code analysis ()" on a run that had analysed the project fine.
+          # The Control Center's own parser says it plainly: "the verdict is the single
+          # key of the envelope's `result`".
+          RESULT=$(jq -r '.result | keys[0] // empty' sync.json 2>/dev/null || true)
+          echo "result=${RESULT}" >> "$GITHUB_OUTPUT"
+          echo "::notice::sync verdict: ${RESULT}"
+          # EMPTY IS UNREADABLE, and that is the whole point of this check. The previous
+          # version tested only for the literal `unknown`, so a missing, null or
+          # unparseable verdict — every realistic way this fails — walked straight past
+          # the guard that exists to catch it. Reading the exit code alone reports a
+          # partial analysis as a clean one, which is what the verdict is for.
+          if [ -z "$RESULT" ]; then
+            echo "::error::the sync produced no readable verdict"
+            exit 1
+          fi
+
+      - name: Propose the results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERDICT: ${{ steps.analyse.outputs.result }}
+          TAG: ${{ steps.toolchain.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "predictable-code[bot]"
+          git config user.email "predictable-code[bot]@users.noreply.github.com"
+
+          # THE REPOSITORY'S OWN GIT HOOKS DO NOT RUN FOR THIS PUSH, and that is a
+          # correctness requirement rather than a convenience.
+          #
+          # Measured on a real repository: a `husky` pre-push hook ran the project's
+          # frontend test suite, two tests were ALREADY failing for reasons that have
+          # nothing to do with us, and git refused the push — so a completed analysis
+          # was produced, committed, and then thrown away. Any repository with a red
+          # test could never receive results.
+          #
+          # The hooks exist to gate a HUMAN pushing CODE. This commit touches nothing
+          # but `.predictable-code/`, changes no source, and is offered as a pull
+          # request the repository reviews and runs its own CI against — so the gate
+          # those hooks provide is not being skipped, it is being applied where it
+          # belongs. Disabling by `core.hooksPath` rather than `--no-verify` per
+          # command, so a hook cannot reappear through a git call somebody adds later.
+          git config core.hooksPath /dev/null
+
+          BRANCH="predictable/analysis-${GITHUB_RUN_ID}"
+          git checkout -b "$BRANCH"
+          # THE SPECS DIRECTORY TOO, because the product writes specs THERE.
+          #
+          # Markillo specs are the customer's own documents and live in their tree, not
+          # in our state directory: `resolveNewSpecsDir` puts them at `<repo>/specs`
+          # unless `defaultSpecsDir` says otherwise. Staging only `.predictable-code`
+          # therefore threw every inferred spec away — measured on a real run, which
+          # committed `.predictable-code/specs/locations/SPEC-001…004/` (evidence the
+          # specs existed) while the specs themselves were never added, so the pull
+          # request carried witness locations pointing at documents that were not in it.
+          #
+          # Read from the project's OWN config rather than assumed, because it is
+          # configurable and a hard-coded `specs` would be wrong for any project that
+          # set it. Added only if it exists: `git add` on a missing path is an error,
+          # and a project with no specs yet is an ordinary state, not a failure.
+          SPECS_DIR=$(jq -r '.defaultSpecsDir // "specs"' .predictable-code/project.json 2>/dev/null || echo specs)
+          git add -A .predictable-code
+          if [ -d "$SPECS_DIR" ]; then
+            echo "::notice::staging inferred specs from ${SPECS_DIR}/"
+            git add -A "$SPECS_DIR"
+          fi
+
+          if git diff --cached --quiet; then
+            echo "::notice::the analysis changed nothing; no pull request opened"
+            exit 0
+          fi
+
+          git commit -m "Predictable Code analysis (${VERDICT})" \
+            -m "Produced by ${TAG} on ${GITHUB_SHA}. Verdict: ${VERDICT}."
+          git push origin "$BRANCH"
+
+          # The verdict is in the title because it is the first thing a reader needs:
+          # a `degraded` run analysed part of the project, and a PR that did not say so
+          # would read as a full one.
+          # Written to a file, not passed inline: a quoted multi-line argument inside an
+          # indented YAML block carries that indentation into the rendered markdown.
+          {
+            echo "Analysis of \`${GITHUB_SHA}\`, produced by \`${TAG}\` in this repository's own Actions."
+            echo
+            echo "**Verdict: \`${VERDICT}\`** — \`degraded\` means only part of the project translated, and \`mechanical\` means the run stopped before the proving tail. Neither is a failure, and neither is a clean bill."
+            echo
+            echo "Only \`.predictable-code/\` and your specs directory are written — no source file is changed."
+          } > /tmp/pc-body.md
+
+          gh pr create \
+            --title "Predictable Code analysis (${VERDICT})" \
+            --body-file /tmp/pc-body.md \
+            --head "$BRANCH"
